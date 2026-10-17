@@ -1,0 +1,28 @@
+{
+  "name": "supermemory-app",
+  "private": true,
+  "type": "module",
+  "description": "Experimental Photon App that mirrors inbound messages to Supermemory (ENG-4010).",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --watch src/main.ts",
+    "start": "node --env-file-if-exists=.env src/main.ts",
+    "keygen": "node scripts/generate-key.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.5",
+    "@photon-hq/auth-api": "0.0.0-staging.65",
+    "hono": "4.13.13",
+    "jose": "6.2.12",
+    "standardwebhooks": "1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
