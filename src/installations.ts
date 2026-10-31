@@ -2,13 +2,18 @@ import { open, seal } from "./crypto.ts";
 import type { InstallationRow, Store } from "./db.ts";
 import type { PhotonApi } from "./photon/api.ts";
 import { PhotonError } from "./photon/http.ts";
-import type { InstallationClient } from "./photon/installations.ts";
-import type { ProvisionReport, WebhookProvisioner } from "./photon/provisioner.ts";
+import type { InstallationClient, RedeemResult } from "./photon/installations.ts";
 import { TokenError, type TokenSource } from "./photon/token.ts";
 
 export type CallbackOutcome =
-  | { kind: "installed"; installation: InstallationRow; check: CheckResult; provision: ProvisionReport | null }
-  | { kind: "not-delivered"; status: string; installationId?: string };
+  | { kind: "installed"; installation: InstallationRow; check: CheckResult }
+  | {
+      kind: "not-delivered";
+      status: Exclude<RedeemResult["status"], "created">;
+      installationId: string;
+      /** This service already holds the credential (e.g. the callback was opened twice). */
+      stored: boolean;
+    };
 
 export type CheckResult =
   | { status: "active"; organizationId: string; organizationName: string }
@@ -18,17 +23,18 @@ export type CheckResult =
 
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-/** Install, check and keep provisioning installations of this App. */
+/** Install this App and keep checking that each installation is still active. */
 export function createInstallationService(options: {
   store: Store;
   dataKey: Buffer;
   installations: InstallationClient;
   tokens: TokenSource;
   api: PhotonApi;
-  provisioner: WebhookProvisioner;
+  /** Called when an installation checks out active, so deliveries waiting for it go out. */
+  onActive?: (installationId: string) => void;
   log?: (line: string) => void;
 }) {
-  const { store, dataKey, tokens, api, provisioner } = options;
+  const { store, dataKey, tokens, api } = options;
   const log = options.log ?? (() => {});
 
   const credentialOf = (row: InstallationRow) => ({
@@ -41,7 +47,7 @@ export function createInstallationService(options: {
    * organization means active. A refused credential, or a 401/403 from
    * Photon, means uninstalled or suspended.
    */
-  async function check(row: InstallationRow): Promise<{ result: CheckResult; token?: string }> {
+  async function check(row: InstallationRow): Promise<CheckResult> {
     try {
       const token = await tokens.token(credentialOf(row));
       const organization = await api.currentOrganization(token);
@@ -49,10 +55,12 @@ export function createInstallationService(options: {
         id: organization.organizationId,
         name: organization.name,
       });
-      return {
-        result: { status: "active", organizationId: organization.organizationId, organizationName: organization.name },
-        token,
-      };
+      if (row.status !== "active") {
+        // Newly bound or resumed: deliveries quarantined for it go out now.
+        store.releaseDeliveries(row.installation_id);
+        options.onActive?.(row.installation_id);
+      }
+      return { status: "active", organizationId: organization.organizationId, organizationName: organization.name };
     } catch (error) {
       const gone =
         (error instanceof TokenError && error.refused) ||
@@ -61,37 +69,33 @@ export function createInstallationService(options: {
         tokens.forget(row.client_id);
         store.setInstallationStatus(row.installation_id, "inactive", describe(error));
         if (row.status === "active") {
-          provisioner.release(row);
           log(`installation ${row.installation_id}: now inactive (${describe(error)})`);
         }
-        return { result: { status: "inactive", detail: describe(error) } };
+        return { status: "inactive", detail: describe(error) };
       }
       log(`installation ${row.installation_id}: check failed (${describe(error)})`);
-      return { result: { status: "unknown", detail: describe(error) } };
+      return { status: "unknown", detail: describe(error) };
     }
   }
 
-  async function checkAndProvision(installationId: string) {
+  async function checkInstallation(installationId: string) {
     const row = store.getInstallation(installationId);
     if (!row) throw new Error(`Unknown installation ${installationId}`);
-    const { result, token } = await check(row);
-    let provision: ProvisionReport | null = null;
-    if (result.status === "active" && token) {
-      try {
-        provision = await provisioner.ensure(store.getInstallation(installationId)!, token);
-      } catch (error) {
-        provision = { mode: provisioner.mode, summary: `Provisioning failed: ${describe(error)}`, projects: [] };
-      }
-    }
-    return { installation: store.getInstallation(installationId)!, check: result, provision };
+    const result = await check(row);
+    return { installation: store.getInstallation(installationId)!, check: result };
   }
 
   return {
-    /** The install callback: redeem the code, keep the credential, then check and provision. */
+    /** The install callback: redeem the code, keep the credential, then check it. */
     async completeInstall(code: string): Promise<CallbackOutcome> {
       const delivery = await options.installations.redeem(code);
-      if (delivery.status !== "created" || !("clientSecret" in delivery)) {
-        return { kind: "not-delivered", status: delivery.status, installationId: delivery.installationId };
+      if (delivery.status !== "created") {
+        return {
+          kind: "not-delivered",
+          status: delivery.status,
+          installationId: delivery.installationId,
+          stored: Boolean(store.getInstallation(delivery.installationId)),
+        };
       }
       // Stored before anything else can fail: this answer can't be fetched again.
       if (store.getInstallation(delivery.installationId)) {
@@ -103,14 +107,14 @@ export function createInstallationService(options: {
         clientSecretSealed: seal(dataKey, delivery.clientSecret),
       });
       log(`installation ${delivery.installationId}: credential stored`);
-      return { kind: "installed", ...(await checkAndProvision(delivery.installationId)) };
+      return { kind: "installed", ...(await checkInstallation(delivery.installationId)) };
     },
 
-    checkAndProvision,
+    checkInstallation,
 
     /** Periodic: every stored installation, so suspended ones are noticed when they resume. */
     async checkAll() {
-      for (const row of store.listInstallations()) await checkAndProvision(row.installation_id);
+      for (const row of store.listInstallations()) await checkInstallation(row.installation_id);
     },
   };
 }

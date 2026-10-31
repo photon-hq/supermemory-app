@@ -13,10 +13,18 @@ export interface InstallationRequest {
   createdAt: string;
 }
 
-/** `status: "created"` is the only answer that carries the credential, and only once. */
+/**
+ * `created` is the only answer that carries the credential, and only once.
+ * The others: `delivery_consumed` (already handed over), `recovery_required`
+ * (an admin repairs it in Photon), `revocation_pending` and `revoked` (the
+ * installation is going or gone).
+ */
 export type RedeemResult =
   | { status: "created"; installationId: string; clientId: string; clientSecret: string }
-  | { status: string; installationId?: string };
+  | {
+      status: "delivery_consumed" | "recovery_required" | "revocation_pending" | "revoked";
+      installationId: string;
+    };
 
 export function createInstallationClient(options: {
   apiOrigin: string;
@@ -46,6 +54,15 @@ export function createInstallationClient(options: {
           }),
         },
       );
+      // Photon echoes what it recorded; anything else isn't our request.
+      if (
+        !request.requestId?.startsWith("pho_air_") ||
+        request.appId !== options.appId ||
+        request.state !== state ||
+        request.redirectUri !== options.redirectUri
+      ) {
+        throw new Error("Photon's answer to the install request doesn't match what was sent");
+      }
       const approveUrl = new URL("/organization/install", options.dashboardOrigin);
       approveUrl.searchParams.set("requestId", request.requestId);
       return { request, approveUrl: approveUrl.href };

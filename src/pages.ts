@@ -29,14 +29,13 @@ function page(title: string, body: string): string {
 }
 
 const statusClass = (result: string) =>
-  result === "active" || result === "created" || result === "existing" || result === "done"
-    ? "ok"
-    : result === "refused" || result === "inactive" || result === "failed"
-      ? "bad"
-      : "warn";
+  result === "active" || result === "done" ? "ok" : result === "inactive" || result === "failed" ? "bad" : "warn";
+
+const SCOPE_NOTE =
+  "Photon sends this App <code>message.received</code> from the projects the admin chose when installing. " +
+  "Projects created later are included only if they chose All projects; they can change this under Integrations → Apps.";
 
 export function homePage(options: {
-  mode: string;
   installations: InstallationRow[];
   deliveries: { status: string; count: number }[];
 }): string {
@@ -44,7 +43,7 @@ export function homePage(options: {
     .map(
       (row) => `<tr>
   <td>${escape(row.organization_name ?? "Unknown organization")}<br><code class="muted">${escape(row.installation_id)}</code></td>
-  <td class="${statusClass(row.status)}">${escape(row.status)}${row.status_detail ? `<br><span class="muted">${escape(row.status_detail)}</span>` : ""}</td>
+  <td class="${statusClass(row.status)}">${escape(row.organization_id ? row.status : "waiting for the first check")}${row.status_detail ? `<br><span class="muted">${escape(row.status_detail)}</span>` : ""}</td>
   <td class="muted">${escape(row.checked_at ?? "never")}</td>
 </tr>`,
     )
@@ -62,33 +61,52 @@ export function homePage(options: {
 ${rows ? `<table><tr><th>Organization</th><th>Status</th><th>Last checked</th></tr>${rows}</table>` : `<p class="muted">Not installed anywhere yet.</p>`}
 <h2>Messages relayed</h2>
 <p>${deliveries}</p>
-<p class="muted">Webhook mode: <code>${escape(options.mode)}</code></p>`,
+<p class="muted">${SCOPE_NOTE}</p>`,
   );
 }
 
+/** What each credential-less redeem answer means for the admin, per Photon's App guide. */
+const NOT_DELIVERED: Record<Extract<CallbackOutcome, { kind: "not-delivered" }>["status"], { title: string; body: string }> = {
+  delivery_consumed: {
+    title: "Nothing new to collect",
+    body: "Photon handed this installation's credential over once already and won't send it again.",
+  },
+  recovery_required: {
+    title: "The installation needs repair",
+    body: "Photon can't hand over this installation's credential. An Owner or Admin can repair it from Integrations → Apps in Photon, then install again from here.",
+  },
+  revocation_pending: {
+    title: "This installation is being removed",
+    body: "Photon is revoking this installation, so it isn't connected. Install again from here to reconnect.",
+  },
+  revoked: {
+    title: "This installation was removed",
+    body: "Photon has revoked this installation, so it isn't connected. Install again from here to reconnect.",
+  },
+};
+
 export function callbackPage(outcome: CallbackOutcome): string {
   if (outcome.kind === "not-delivered") {
+    const { title, body } = NOT_DELIVERED[outcome.status];
+    const stored =
+      outcome.status === "delivery_consumed" && outcome.stored
+        ? "<p>This service already has it, so nothing is lost: the installation stays connected.</p>"
+        : "";
     return page(
-      "Already connected",
-      `<h1>Nothing new to collect</h1>
-<p>Photon reports this installation as <code>${escape(outcome.status)}</code>. Its credential was handed over once already and can't be sent again.</p>
-<p class="muted">If this service lost it, an Owner or Admin can repair the installation in Photon's Apps page, then install again from here.</p>
+      title,
+      `<h1>${escape(title)}</h1>
+<p>${escape(body)}</p>${stored}
+<p class="muted">Installation <code>${escape(outcome.installationId)}</code> · <code>${escape(outcome.status)}</code></p>
 <a class="button" href="/">Back</a>`,
     );
   }
-  const { installation, check, provision } = outcome;
-  const projects = (provision?.projects ?? [])
-    .map(
-      (p) => `<tr><td>${escape(p.projectName)}<br><code class="muted">${escape(p.projectId)}</code></td>
-<td class="${statusClass(p.result)}">${escape(p.result)}${p.detail ? `<br><span class="muted">${escape(p.detail)}</span>` : ""}</td></tr>`,
-    )
-    .join("");
+  const { installation, check } = outcome;
   return page(
     "Installed",
     `<h1>Installed${check.status === "active" ? ` in ${escape(check.organizationName)}` : ""}</h1>
 <p>Installation <code>${escape(installation.installation_id)}</code>:
 <span class="${statusClass(check.status)}">${escape(check.status)}</span>${"detail" in check ? ` — ${escape(check.detail)}` : ""}</p>
-${provision ? `<h2>Webhooks (${escape(provision.mode)})</h2><p>${escape(provision.summary)}</p>${projects ? `<table>${projects}</table>` : ""}` : ""}
+<p>${SCOPE_NOTE}</p>
 <a class="button" href="/">Done</a>`,
   );
 }

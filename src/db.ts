@@ -17,19 +17,9 @@ export interface InstallationRow {
   checked_at: string | null;
 }
 
-export interface DestinationRow {
-  key: string;
-  organization_id: string;
-  project_id: string;
-  installation_id: string;
-  destination_id: string;
-  secret_sealed: string;
-  created_at: string;
-}
-
 export interface DeliveryRow {
-  webhook_id: string;
-  destination_key: string;
+  installation_id: string;
+  event_id: string;
   organization_id: string;
   project_id: string;
   status: DeliveryStatus;
@@ -39,6 +29,11 @@ export interface DeliveryRow {
   last_error: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface DeliveryKey {
+  installationId: string;
+  eventId: string;
 }
 
 const SCHEMA = `
@@ -58,19 +53,9 @@ CREATE TABLE IF NOT EXISTS installations (
   created_at TEXT NOT NULL,
   checked_at TEXT
 );
-CREATE TABLE IF NOT EXISTS destinations (
-  key TEXT PRIMARY KEY,
-  organization_id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  installation_id TEXT NOT NULL,
-  destination_id TEXT NOT NULL,
-  secret_sealed TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE (installation_id, project_id)
-);
 CREATE TABLE IF NOT EXISTS deliveries (
-  webhook_id TEXT PRIMARY KEY,
-  destination_key TEXT NOT NULL,
+  installation_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
   organization_id TEXT NOT NULL,
   project_id TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -79,10 +64,25 @@ CREATE TABLE IF NOT EXISTS deliveries (
   payload_sealed TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (installation_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries (status, next_attempt_at);
 `;
+
+const SCHEMA_VERSION = 2;
+
+/**
+ * v1 relayed per-destination webhooks (made by hand or by the App). v2
+ * receives App subscription deliveries, keyed by installation. Installations
+ * and their sealed credentials are kept: Photon hands those out only once.
+ */
+function migrate(db: DatabaseSync) {
+  const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (version >= SCHEMA_VERSION) return;
+  db.exec("DROP TABLE IF EXISTS destinations; DROP TABLE IF EXISTS deliveries;");
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+}
 
 const now = () => new Date().toISOString();
 
@@ -92,6 +92,7 @@ export function openStore(path: string) {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  migrate(db);
   db.exec(SCHEMA);
 
   return {
@@ -146,48 +147,11 @@ export function openStore(path: string) {
     listInstallations() {
       return db.prepare("SELECT * FROM installations ORDER BY created_at DESC").all() as unknown as InstallationRow[];
     },
-    /** The organization's newest installation that last checked out. */
-    activeInstallationFor(organizationId: string) {
-      return db
-        .prepare(
-          `SELECT * FROM installations WHERE organization_id = ? AND status = 'active'
-           ORDER BY created_at DESC LIMIT 1`,
-        )
-        .get(organizationId) as InstallationRow | undefined;
-    },
-
-    // --- destinations the App created itself (manual ones live in config) ---
-    insertDestination(row: Omit<DestinationRow, "created_at">) {
-      db.prepare(
-        `INSERT INTO destinations (key, organization_id, project_id, installation_id, destination_id, secret_sealed, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        row.key,
-        row.organization_id,
-        row.project_id,
-        row.installation_id,
-        row.destination_id,
-        row.secret_sealed,
-        now(),
-      );
-    },
-    getDestination(key: string) {
-      return db.prepare("SELECT * FROM destinations WHERE key = ?").get(key) as DestinationRow | undefined;
-    },
-    destinationsFor(installationId: string) {
-      return db
-        .prepare("SELECT * FROM destinations WHERE installation_id = ?")
-        .all(installationId) as unknown as DestinationRow[];
-    },
-    deleteDestination(key: string) {
-      db.prepare("DELETE FROM destinations WHERE key = ?").run(key);
-    },
-
-    // --- deliveries: one row per webhook-id, so Photon's retries are no-ops ---
-    /** False when this webhook-id was seen before. */
+    // --- deliveries: one row per installation and event, so Photon's retries are no-ops ---
+    /** False when this installation's event was seen before. */
     enqueueDelivery(row: {
-      webhookId: string;
-      destinationKey: string;
+      installationId: string;
+      eventId: string;
       organizationId: string;
       projectId: string;
       payloadSealed: string;
@@ -196,10 +160,10 @@ export function openStore(path: string) {
       const result = db
         .prepare(
           `INSERT OR IGNORE INTO deliveries
-             (webhook_id, destination_key, organization_id, project_id, status, next_attempt_at, payload_sealed, created_at, updated_at)
+             (installation_id, event_id, organization_id, project_id, status, next_attempt_at, payload_sealed, created_at, updated_at)
            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
         )
-        .run(row.webhookId, row.destinationKey, row.organizationId, row.projectId, t, row.payloadSealed, t, t);
+        .run(row.installationId, row.eventId, row.organizationId, row.projectId, t, row.payloadSealed, t, t);
       return result.changes > 0;
     },
     dueDeliveries(limit: number) {
@@ -211,25 +175,44 @@ export function openStore(path: string) {
         .all(now(), limit) as unknown as DeliveryRow[];
     },
     /** Finished either way: the queued message is dropped, only the outcome stays. */
-    finishDelivery(webhookId: string, status: Exclude<DeliveryStatus, "pending">, detail: string | null) {
+    finishDelivery(key: DeliveryKey, status: Exclude<DeliveryStatus, "pending">, detail: string | null) {
       db.prepare(
         `UPDATE deliveries SET status = ?, last_error = ?, payload_sealed = NULL, attempts = attempts + 1, updated_at = ?
-         WHERE webhook_id = ?`,
-      ).run(status, detail, now(), webhookId);
+         WHERE installation_id = ? AND event_id = ?`,
+      ).run(status, detail, now(), key.installationId, key.eventId);
     },
-    retryDelivery(webhookId: string, at: Date, detail: string) {
+    retryDelivery(key: DeliveryKey, at: Date, detail: string) {
       db.prepare(
         `UPDATE deliveries SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ?
-         WHERE webhook_id = ?`,
-      ).run(at.toISOString(), detail, now(), webhookId);
+         WHERE installation_id = ? AND event_id = ?`,
+      ).run(at.toISOString(), detail, now(), key.installationId, key.eventId);
+    },
+    /** Waiting for its installation: try again later without using up a Supermemory attempt. */
+    deferDelivery(key: DeliveryKey, at: Date, detail: string) {
+      db.prepare(
+        `UPDATE deliveries SET next_attempt_at = ?, last_error = ?, updated_at = ?
+         WHERE installation_id = ? AND event_id = ?`,
+      ).run(at.toISOString(), detail, now(), key.installationId, key.eventId);
+    },
+    /**
+     * Quarantined deliveries for this installation become due now (it was
+     * just bound). Ones in a Supermemory backoff (attempts > 0) keep their time.
+     */
+    releaseDeliveries(installationId: string) {
+      db.prepare(
+        `UPDATE deliveries SET next_attempt_at = ?, updated_at = ?
+         WHERE installation_id = ? AND status = 'pending' AND attempts = 0`,
+      ).run(now(), now(), installationId);
     },
     deliveryCounts() {
       return db
         .prepare("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status")
         .all() as unknown as { status: DeliveryStatus; count: number }[];
     },
-    getDelivery(webhookId: string) {
-      return db.prepare("SELECT * FROM deliveries WHERE webhook_id = ?").get(webhookId) as DeliveryRow | undefined;
+    getDelivery(key: DeliveryKey) {
+      return db
+        .prepare("SELECT * FROM deliveries WHERE installation_id = ? AND event_id = ?")
+        .get(key.installationId, key.eventId) as DeliveryRow | undefined;
     },
   };
 }

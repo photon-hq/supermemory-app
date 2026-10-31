@@ -4,9 +4,23 @@ import { Webhook } from "standardwebhooks";
 export const ORG_ID = "pho_org_01testorganization000000000";
 export const PROJECT_ID = "pho_prj_01testproject00000000000000";
 export const SENDER_ID = "pho_usr_01testsender000000000000000";
+export const INSTALLATION_ID = "pho_ain_01testinstallation00000000";
 
-/** A `message.received` event shaped like Photon's `ImessageMessageReceivedEvent` (API 2026-07-01). */
-export function messageReceived(overrides: { messageId?: string; content?: unknown; type?: string } = {}) {
+/**
+ * A `message.received` App delivery: Photon's `ImessageMessageReceivedEvent`
+ * (API 2026-07-01) plus the signed `app_installation_id` and
+ * `data.organizationId` Fusor adds for an App (contracts#35).
+ */
+export function messageReceived(
+  overrides: {
+    messageId?: string;
+    content?: unknown;
+    type?: string;
+    installationId?: string;
+    organizationId?: string;
+    messageProjectId?: string;
+  } = {},
+) {
   const messageId = overrides.messageId ?? "pho_msg_01testmessage0000000000000";
   return {
     id: `pho_evt_${messageId.slice(8)}`,
@@ -14,11 +28,13 @@ export function messageReceived(overrides: { messageId?: string; content?: unkno
     apiVersion: "2026-07-01",
     source: "imessage.photon",
     timestamp: "2026-10-17T10:00:01.000Z",
+    app_installation_id: overrides.installationId ?? INSTALLATION_ID,
     data: {
+      organizationId: overrides.organizationId ?? ORG_ID,
       projectId: PROJECT_ID,
       object: {
         id: messageId,
-        projectId: PROJECT_ID,
+        projectId: overrides.messageProjectId ?? PROJECT_ID,
         platform: "imessage",
         status: "received",
         space: { id: "pho_spc_01testspace000000000000000", projectId: PROJECT_ID, platform: "imessage", kind: "direct", participantIds: [SENDER_ID], details: {}, metadata: {} },

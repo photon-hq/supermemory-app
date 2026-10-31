@@ -3,6 +3,15 @@
 Linear: https://linear.app/photonhq/issue/ENG-4010/experimental-supermemory-app
 Branch name if this becomes a repo: `kelly/eng-4010-experimental-supermemory-app`
 
+> **Update 2026-10-30:** the block below is resolved, differently than asked.
+> [ENG-4110](https://linear.app/photonhq/issue/ENG-4110) shipped App event
+> subscriptions: the App registers one webhook URL and `message.received`
+> (permission `messages:read`), and Photon delivers from every project in the
+> installation's scope. The App doesn't create webhooks at all, so the
+> `manual`/`app` provisioners below were removed. See the README and
+> [photon-hq/docs#126](https://github.com/photon-hq/docs/pull/126). The rest
+> of this file is the original plan, kept for history.
+
 Read ENG-4010's description and its comment thread before starting. They hold
 the evidence behind every constraint below.
 
