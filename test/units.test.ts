@@ -1,14 +1,29 @@
 import { randomBytes } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { decodeJwt, decodeProtectedHeader, exportPKCS8, generateKeyPair } from "jose";
 import { describe, expect, it } from "vitest";
 import { open, seal } from "../src/crypto.ts";
+import { openStore } from "../src/db.ts";
 import { createAssertionSigner } from "../src/photon/assertion.ts";
 import { createInstallationClient } from "../src/photon/installations.ts";
 import { createTokenSource, TokenError } from "../src/photon/token.ts";
 import { mapMessageEvent, messageText, namespaceFor } from "../src/relay/map.ts";
-import { verifyWebhook } from "../src/relay/verify.ts";
+import { parseAppEvent, verifyWebhook } from "../src/relay/verify.ts";
 import { backoffMs } from "../src/relay/worker.ts";
-import { fakeFetch, json, messageReceived, newWebhookSecret, ORG_ID, PROJECT_ID, SENDER_ID, signedHeaders } from "./fixtures.ts";
+import {
+  fakeFetch,
+  INSTALLATION_ID,
+  json,
+  messageReceived,
+  newWebhookSecret,
+  ORG_ID,
+  PROJECT_ID,
+  SENDER_ID,
+  signedHeaders,
+} from "./fixtures.ts";
 
 describe("crypto", () => {
   const key = randomBytes(32);
@@ -85,6 +100,58 @@ describe("webhook verification", () => {
   });
 });
 
+describe("App delivery routing", () => {
+  it("reads the installation, organization and project Photon signed in", () => {
+    const event = messageReceived();
+    expect(parseAppEvent(event, event.id)).toEqual({
+      eventId: event.id,
+      type: "message.received",
+      installationId: INSTALLATION_ID,
+      organizationId: ORG_ID,
+      projectId: PROJECT_ID,
+    });
+  });
+
+  it("refuses a mismatched event id, an ordinary project webhook, or a message from another project", () => {
+    const event = messageReceived();
+    expect(() => parseAppEvent(event, "pho_evt_other")).toThrow("webhook-id");
+    const { app_installation_id: _, ...ordinary } = event;
+    expect(() => parseAppEvent(ordinary, event.id)).toThrow("app_installation_id");
+    const moved = messageReceived({ messageProjectId: "pho_prj_elsewhere" });
+    expect(() => parseAppEvent(moved, moved.id)).toThrow("project");
+    expect(() => parseAppEvent({}, "")).toThrow();
+  });
+});
+
+describe("store migration", () => {
+  it("moves a v1 database to App deliveries and keeps its installations", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "supermemory-app-")), "v1.db");
+    const v1 = new DatabaseSync(path);
+    v1.exec(`
+      CREATE TABLE installations (installation_id TEXT PRIMARY KEY, organization_id TEXT, organization_name TEXT,
+        client_id TEXT NOT NULL, client_secret_sealed TEXT NOT NULL, status TEXT NOT NULL, status_detail TEXT,
+        created_at TEXT NOT NULL, checked_at TEXT);
+      CREATE TABLE destinations (key TEXT PRIMARY KEY);
+      CREATE TABLE deliveries (webhook_id TEXT PRIMARY KEY, destination_key TEXT NOT NULL);
+      INSERT INTO installations VALUES ('pho_ain_old', NULL, NULL, 'client_1', 'sealed', 'active', NULL, 't', NULL);
+      INSERT INTO deliveries VALUES ('msg_1', 'test-destination');
+    `);
+    v1.close();
+
+    const store = openStore(path);
+    expect(store.getInstallation("pho_ain_old")).toMatchObject({ client_secret_sealed: "sealed" });
+    expect(store.deliveryCounts()).toEqual([]);
+    expect(
+      store.enqueueDelivery({ installationId: "pho_ain_old", eventId: "pho_evt_1", organizationId: ORG_ID, projectId: PROJECT_ID, payloadSealed: "p" }),
+    ).toBe(true);
+    store.close();
+    // Opening it again leaves v2 alone.
+    const again = openStore(path);
+    expect(again.getDelivery({ installationId: "pho_ain_old", eventId: "pho_evt_1" })).toBeDefined();
+    again.close();
+  });
+});
+
 describe("installation client", () => {
   it("signs each call for its own endpoint and sends the admin to Photon's approval page", async () => {
     const { privateKey } = await generateKeyPair("ES256", { extractable: true });
@@ -99,7 +166,7 @@ describe("installation client", () => {
       "POST https://api.staging.photon.codes/v1/installation-requests/redeem": () =>
         json({ status: "created", installationId: "pho_ain_1", clientId: "client_1", clientSecret: "s" }),
       "POST https://api.staging.photon.codes/v1/installation-requests": () =>
-        json({ requestId: "pho_air_1", appId: "pho_app_test", appVersion: "1", redirectUri: "x", state: "st", createdAt: "t" }, 201),
+        json({ requestId: "pho_air_1", appId: "pho_app_test", appVersion: "1", redirectUri: "https://relay.example/callback", state: "st", createdAt: "t" }, 201),
     });
     const client = createInstallationClient({
       apiOrigin: "https://api.staging.photon.codes",
@@ -121,6 +188,28 @@ describe("installation client", () => {
     expect(decodeJwt(redeem!.clientAssertion!).aud).toBe("https://api.staging.photon.codes/v1/installation-requests/redeem");
     expect(decodeJwt(redeem!.clientAssertion!).jti).not.toBe(decodeJwt(request!.clientAssertion!).jti);
     expect(redeem!.code).toBe("code-1");
+  });
+
+  it("refuses an install request answer that doesn't echo what was sent", async () => {
+    const { privateKey } = await generateKeyPair("ES256", { extractable: true });
+    const client = createInstallationClient({
+      apiOrigin: "https://api.staging.photon.codes",
+      dashboardOrigin: "https://app.staging.photon.codes",
+      appId: "pho_app_test",
+      redirectUri: "https://relay.example/callback",
+      sign: await createAssertionSigner({
+        apiOrigin: "https://api.staging.photon.codes",
+        appId: "pho_app_test",
+        keyId: "test-key",
+        algorithm: "ES256",
+        privateKeyPem: await exportPKCS8(privateKey),
+      }),
+      fetch: fakeFetch({
+        "POST https://api.staging.photon.codes/v1/installation-requests": () =>
+          json({ requestId: "pho_air_1", appId: "pho_app_test", appVersion: "1", redirectUri: "https://relay.example/callback", state: "other", createdAt: "t" }, 201),
+      }).fetch,
+    });
+    await expect(client.request("st")).rejects.toThrow("doesn't match");
   });
 });
 

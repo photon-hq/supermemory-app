@@ -5,7 +5,6 @@ import { createInstallationService } from "./installations.ts";
 import { createPhotonApi } from "./photon/api.ts";
 import { createAssertionSigner } from "./photon/assertion.ts";
 import { createInstallationClient } from "./photon/installations.ts";
-import { createAppProvisioner, createManualProvisioner } from "./photon/provisioner.ts";
 import { createTokenSource } from "./photon/token.ts";
 import { createRelayWorker } from "./relay/worker.ts";
 import { createSupermemoryClient } from "./relay/supermemory.ts";
@@ -35,29 +34,19 @@ const installClient = createInstallationClient({
   sign,
 });
 const api = createPhotonApi({ apiOrigin: config.photonApiOrigin });
-const provisioner =
-  config.provisioner === "app"
-    ? createAppProvisioner({
-        store,
-        api,
-        dataKey: config.dataKey,
-        publicBaseUrl: config.publicBaseUrl,
-        webhookApiVersion: config.photonWebhookApiVersion,
-      })
-    : createManualProvisioner(config.manualDestinations);
+const worker = createRelayWorker({
+  store,
+  dataKey: config.dataKey,
+  supermemory: createSupermemoryClient({ apiOrigin: config.supermemoryApiOrigin, apiKey: config.supermemoryApiKey }),
+  log,
+});
 const installations = createInstallationService({
   store,
   dataKey: config.dataKey,
   installations: installClient,
   tokens: createTokenSource({ tokenUrl: config.photonTokenUrl }),
   api,
-  provisioner,
-  log,
-});
-const worker = createRelayWorker({
-  store,
-  dataKey: config.dataKey,
-  supermemory: createSupermemoryClient({ apiOrigin: config.supermemoryApiOrigin, apiKey: config.supermemoryApiKey }),
+  onActive: () => void worker.kick(),
   log,
 });
 
@@ -68,7 +57,7 @@ const app = createApp({
   secureCookies: new URL(config.publicBaseUrl).protocol === "https:",
   installClient,
   installations,
-  provisioner,
+  webhookSecret: config.webhookSecret,
   onQueued: () => void worker.kick(),
   log,
 });
@@ -81,7 +70,7 @@ setInterval(healthCheck, HEALTH_INTERVAL_MS).unref();
 void healthCheck();
 
 const server = serve({ fetch: app.fetch, port: config.port }, ({ port }) => {
-  log(`supermemory-app on :${port} (${provisioner.mode} webhooks), public at ${config.publicBaseUrl}`);
+  log(`supermemory-app on :${port}, events at ${new URL("/webhooks/photon", config.publicBaseUrl).href}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
