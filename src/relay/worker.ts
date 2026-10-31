@@ -5,9 +5,8 @@ import { SupermemoryError, type SupermemoryClient } from "./supermemory.ts";
 
 export const MAX_ATTEMPTS = 8;
 
-/** How long a delivery waits for its installation to be bound before it's dropped. */
+/** How long a delivery is held for its installation (to be bound, or active again) before it's dropped. */
 export const QUARANTINE_MS = 24 * 3_600_000;
-const QUARANTINE_RECHECK_MS = 60_000;
 
 /** 30s, 1m, 2m, … capped at an hour. */
 export const backoffMs = (attempts: number) => Math.min(30_000 * 2 ** attempts, 3_600_000);
@@ -15,13 +14,17 @@ export const backoffMs = (attempts: number) => Math.min(30_000 * 2 ** attempts, 
 /**
  * Sends queued deliveries to Supermemory, each only while the installation it
  * names is active and bound to the organization it names. Photon can deliver
- * before the install callback has stored the credential, so a delivery for an
- * installation that isn't bound yet waits (quarantine) instead of failing.
+ * before the install callback has stored the credential, and right after a
+ * resume, before the health check has seen it. So a delivery for an
+ * installation that isn't bound or active yet is held (quarantine) until the
+ * installation checks out active, instead of being dropped.
  */
 export function createRelayWorker(options: {
   store: Store;
   dataKey: Buffer;
   supermemory: SupermemoryClient;
+  /** A delivery was held for this stored installation: check it again soon. */
+  onHold?: (installationId: string) => void;
   now?: () => number;
   log?: (line: string) => void;
 }) {
@@ -38,26 +41,32 @@ export function createRelayWorker(options: {
       return;
     }
     const installation = store.getInstallation(delivery.installation_id);
-    if (!installation?.organization_id) {
-      if (now() - Date.parse(delivery.created_at) >= QUARANTINE_MS) {
-        store.finishDelivery(key, "failed", "installation never bound");
-        log(`${label}: failed, installation never bound`);
-      } else {
-        store.deferDelivery(key, new Date(now() + QUARANTINE_RECHECK_MS), "waiting for the installation to be bound");
-      }
-      return;
-    }
-    if (installation.organization_id !== delivery.organization_id) {
+    if (installation?.organization_id && installation.organization_id !== delivery.organization_id) {
       store.finishDelivery(key, "failed", "organization doesn't match the installation");
       log(`${label}: failed, organization mismatch`);
       return;
     }
-    if (installation.status !== "active") {
-      store.finishDelivery(key, "skipped", "installation inactive");
-      log(`${label}: skipped, installation inactive`);
+    if (!installation?.organization_id || installation.status !== "active") {
+      const bound = Boolean(installation?.organization_id);
+      if (now() - Date.parse(delivery.created_at) >= QUARANTINE_MS) {
+        if (bound) store.finishDelivery(key, "skipped", "installation inactive");
+        else store.finishDelivery(key, "failed", "installation never bound");
+        log(`${label}: ${bound ? "skipped, installation inactive" : "failed, installation never bound"}`);
+      } else {
+        store.holdDelivery(key, bound ? "waiting for the installation to be active" : "waiting for the installation to be bound");
+        if (installation) options.onHold?.(installation.installation_id);
+      }
       return;
     }
-    const mapped = mapMessageEvent(JSON.parse(open(dataKey, delivery.payload_sealed)), delivery.organization_id);
+    let mapped: ReturnType<typeof mapMessageEvent>;
+    try {
+      mapped = mapMessageEvent(JSON.parse(open(dataKey, delivery.payload_sealed)), delivery.organization_id);
+    } catch {
+      // Not the error's text: a JSON error can quote the message.
+      store.finishDelivery(key, "failed", "unreadable payload");
+      log(`${label}: failed, unreadable payload`);
+      return;
+    }
     if (mapped.kind === "skip") {
       store.finishDelivery(key, "skipped", mapped.reason);
       return;
@@ -80,7 +89,15 @@ export function createRelayWorker(options: {
   }
 
   async function processOnce(batch = 20) {
-    for (const delivery of store.dueDeliveries(batch)) await relay(delivery);
+    store.releaseHeldBefore(new Date(now() - QUARANTINE_MS));
+    for (const delivery of store.dueDeliveries(batch)) {
+      try {
+        await relay(delivery);
+      } catch (error) {
+        // One bad row mustn't stop the rest of the queue.
+        log(`delivery ${delivery.installation_id}/${delivery.event_id}: error (${error instanceof Error ? error.message : String(error)})`);
+      }
+    }
   }
 
   return {

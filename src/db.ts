@@ -3,7 +3,8 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export type InstallationStatus = "active" | "inactive";
-export type DeliveryStatus = "pending" | "done" | "skipped" | "failed";
+/** `held`: waiting for its installation (not bound yet, or inactive); not picked up until released. */
+export type DeliveryStatus = "pending" | "held" | "done" | "skipped" | "failed";
 
 export interface InstallationRow {
   installation_id: string;
@@ -187,22 +188,26 @@ export function openStore(path: string) {
          WHERE installation_id = ? AND event_id = ?`,
       ).run(at.toISOString(), detail, now(), key.installationId, key.eventId);
     },
-    /** Waiting for its installation: try again later without using up a Supermemory attempt. */
-    deferDelivery(key: DeliveryKey, at: Date, detail: string) {
+    /** Waiting for its installation: set aside until released, without using up a Supermemory attempt. */
+    holdDelivery(key: DeliveryKey, detail: string) {
       db.prepare(
-        `UPDATE deliveries SET next_attempt_at = ?, last_error = ?, updated_at = ?
+        `UPDATE deliveries SET status = 'held', last_error = ?, updated_at = ?
          WHERE installation_id = ? AND event_id = ?`,
-      ).run(at.toISOString(), detail, now(), key.installationId, key.eventId);
+      ).run(detail, now(), key.installationId, key.eventId);
     },
-    /**
-     * Quarantined deliveries for this installation become due now (it was
-     * just bound). Ones in a Supermemory backoff (attempts > 0) keep their time.
-     */
+    /** This installation just checked out active: its held deliveries are due now. */
     releaseDeliveries(installationId: string) {
       db.prepare(
-        `UPDATE deliveries SET next_attempt_at = ?, updated_at = ?
-         WHERE installation_id = ? AND status = 'pending' AND attempts = 0`,
+        `UPDATE deliveries SET status = 'pending', next_attempt_at = ?, updated_at = ?
+         WHERE installation_id = ? AND status = 'held'`,
       ).run(now(), now(), installationId);
+    },
+    /** Held since before `cutoff`: due now, so the worker can drop them. */
+    releaseHeldBefore(cutoff: Date) {
+      db.prepare(
+        `UPDATE deliveries SET status = 'pending', next_attempt_at = ?, updated_at = ?
+         WHERE status = 'held' AND created_at <= ?`,
+      ).run(now(), now(), cutoff.toISOString());
     },
     deliveryCounts() {
       return db

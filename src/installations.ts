@@ -23,6 +23,9 @@ export type CheckResult =
 
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
+/** At most one on-demand check per installation this often. */
+const RECHECK_INTERVAL_MS = 30_000;
+
 /** Install this App and keep checking that each installation is still active. */
 export function createInstallationService(options: {
   store: Store;
@@ -36,6 +39,7 @@ export function createInstallationService(options: {
 }) {
   const { store, dataKey, tokens, api } = options;
   const log = options.log ?? (() => {});
+  const lastRecheck = new Map<string, number>();
 
   const credentialOf = (row: InstallationRow) => ({
     clientId: row.client_id,
@@ -56,7 +60,7 @@ export function createInstallationService(options: {
         name: organization.name,
       });
       if (row.status !== "active") {
-        // Newly bound or resumed: deliveries quarantined for it go out now.
+        // Newly bound or resumed: deliveries held for it go out now.
         store.releaseDeliveries(row.installation_id);
         options.onActive?.(row.installation_id);
       }
@@ -111,6 +115,20 @@ export function createInstallationService(options: {
     },
 
     checkInstallation,
+
+    /**
+     * A delivery is waiting on this installation: check it now instead of at
+     * the next health check (it may just have been resumed). Throttled.
+     */
+    recheck(installationId: string): Promise<void> {
+      const last = lastRecheck.get(installationId);
+      if (last !== undefined && Date.now() - last < RECHECK_INTERVAL_MS) return Promise.resolve();
+      lastRecheck.set(installationId, Date.now());
+      return checkInstallation(installationId).then(
+        () => {},
+        (error) => log(`installation ${installationId}: recheck failed (${describe(error)})`),
+      );
+    },
 
     /** Periodic: every stored installation, so suspended ones are noticed when they resume. */
     async checkAll() {

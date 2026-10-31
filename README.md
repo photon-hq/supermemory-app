@@ -78,16 +78,25 @@ Photon (every project in the installation's scope) ──message.received──�
     project;
   - the message belongs to that project.
 
-  Anything else gets a 400. Other event types get a 204. Each delivery is
+  Anything else gets a 400. Other event types get a 204, and bodies over 1 MB
+  a 413 before they're read. Each delivery is
   queued once per `(app_installation_id, event.id)` and answered 202 right
   away. The queued body is sealed and dropped once handled.
 - **Routing:** the worker relays a delivery only if its installation is
   active and bound to the organization the delivery names.
   - **Unknown installation** (Photon can deliver before the callback has
-    stored the credential): the delivery waits. It goes out as soon as the
-    install check binds the installation, and is dropped after 24 hours.
+    stored the credential): the delivery is held. It goes out as soon as the
+    install check binds the installation, and fails after 24 hours.
+  - **Inactive installation** (it may just have been resumed, before the
+    health check noticed): the delivery is held and the installation is
+    checked again right away (at most every 30 seconds). It goes out if the
+    check finds it active, and is skipped if it's still inactive after 24
+    hours.
   - **Organization mismatch:** failed.
-  - **Inactive installation:** skipped.
+
+  Held deliveries aren't picked up again until they're released, so they
+  never hold up other installations' messages. A delivery that can't be
+  decrypted or parsed fails without stopping the rest of the queue.
 - **Supermemory:** v5 API. One namespace per sender
   (`photon:<organizationId>:<userId>`), grouped by conversation (space). The
   document id is the Photon message id, so a retry never adds a message
@@ -95,8 +104,8 @@ Photon (every project in the installation's scope) ──message.received──�
   skipped. The sender's handle (phone number or email) is not sent.
 - **Health check** (every 5 minutes and after install): token +
   `/organizations/current`. If either is refused, the installation is marked
-  inactive and its messages are skipped. Photon stops delivering to a paused
-  or uninstalled App anyway; this catches what's already queued.
+  inactive and its messages are held, as above. Photon stops delivering to a
+  paused or uninstalled App anyway; this catches what's already queued.
 - **Retries:** Supermemory 429/5xx/409 back off (30s doubling, up to an hour,
   8 attempts). Other 4xx fail the delivery.
 

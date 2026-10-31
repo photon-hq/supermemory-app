@@ -38,6 +38,7 @@ const worker = createRelayWorker({
   store,
   dataKey: config.dataKey,
   supermemory: createSupermemoryClient({ apiOrigin: config.supermemoryApiOrigin, apiKey: config.supermemoryApiKey }),
+  onHold: (installationId) => void installations.recheck(installationId),
   log,
 });
 const installations = createInstallationService({

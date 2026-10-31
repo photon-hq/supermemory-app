@@ -9,7 +9,7 @@ import { createInstallationClient } from "../src/photon/installations.ts";
 import { createTokenSource } from "../src/photon/token.ts";
 import { createSupermemoryClient } from "../src/relay/supermemory.ts";
 import { createRelayWorker, QUARANTINE_MS } from "../src/relay/worker.ts";
-import { createApp } from "../src/server.ts";
+import { createApp, MAX_WEBHOOK_BYTES } from "../src/server.ts";
 import {
   fakeFetch,
   INSTALLATION_ID,
@@ -70,12 +70,17 @@ async function harness() {
     sign: await createAssertionSigner({ apiOrigin: API, appId: "pho_app_test", keyId: "k", algorithm: "ES256", privateKeyPem: await exportPKCS8(privateKey) }),
     fetch: photon.fetch,
   });
-  const worker = createRelayWorker({
-    store,
-    dataKey,
-    supermemory: createSupermemoryClient({ apiOrigin: SUPERMEMORY, apiKey: "sm-key", fetch: supermemory.fetch }),
-    now: () => state.clock,
-  });
+  /** Checks the worker asked for when it held a delivery; tests await them. */
+  const rechecks: Promise<void>[] = [];
+  const workerWith = (key: Buffer) =>
+    createRelayWorker({
+      store,
+      dataKey: key,
+      supermemory: createSupermemoryClient({ apiOrigin: SUPERMEMORY, apiKey: "sm-key", fetch: supermemory.fetch }),
+      onHold: (installationId) => rechecks.push(installations.recheck(installationId)),
+      now: () => state.clock,
+    });
+  const worker = workerWith(dataKey);
   const installations = createInstallationService({
     store,
     dataKey,
@@ -118,7 +123,7 @@ async function harness() {
   const deliveryOf = (event: { id: string }, installationId = INSTALLATION_ID) =>
     store.getDelivery({ installationId, eventId: event.id });
 
-  return { app, store, state, photon, supermemory, worker, installations, install, deliver, deliveryOf };
+  return { app, store, state, photon, supermemory, worker, workerWith, rechecks, installations, install, deliver, deliveryOf };
 }
 
 describe("App subscription, end to end", () => {
@@ -158,6 +163,9 @@ describe("App subscription, end to end", () => {
     expect((await h.deliver(ordinary)).status).toBe(400);
     // Other subscribed events are acknowledged and ignored.
     expect((await h.deliver(messageReceived({ type: "message.delivered" }))).status).toBe(204);
+    // Too big to be a message event: refused before it's read.
+    const huge = "x".repeat(MAX_WEBHOOK_BYTES + 1);
+    expect((await h.app.request("/webhooks/photon", { method: "POST", body: huge, headers: signedHeaders(newWebhookSecret(), huge, { id: "pho_evt_huge" }) })).status).toBe(413);
     expect(h.store.deliveryCounts()).toEqual([]);
   });
 
@@ -175,7 +183,7 @@ describe("App subscription, end to end", () => {
     const event = messageReceived();
     await h.deliver(event);
     await h.worker.processOnce();
-    expect(h.deliveryOf(event)).toMatchObject({ status: "pending", attempts: 0 });
+    expect(h.deliveryOf(event)).toMatchObject({ status: "held", attempts: 0 });
     expect(h.supermemory.calls).toHaveLength(0);
 
     await h.install();
@@ -187,10 +195,44 @@ describe("App subscription, end to end", () => {
     const h = await harness();
     const event = messageReceived();
     await h.deliver(event);
-    h.state.clock = Date.now() + QUARANTINE_MS;
-    h.store.releaseDeliveries(INSTALLATION_ID);
+    await h.worker.processOnce();
+    expect(h.deliveryOf(event)).toMatchObject({ status: "held" });
+    h.state.clock = Date.now() + QUARANTINE_MS + 1_000;
     await h.worker.processOnce();
     expect(h.deliveryOf(event)).toMatchObject({ status: "failed", last_error: "installation never bound", payload_sealed: null });
+  });
+
+  it("doesn't let held deliveries hold up an active installation's", async () => {
+    const h = await harness();
+    for (let i = 0; i < 25; i++) {
+      await h.deliver(messageReceived({ installationId: "pho_ain_01otherinstallation0000000", messageId: `pho_msg_held${i}` }));
+    }
+    await h.worker.processOnce();
+    await h.worker.processOnce();
+    expect(h.store.deliveryCounts()).toEqual([{ status: "held", count: 25 }]);
+    // Held rows are never picked up again until released, however long they wait.
+    h.state.clock = Date.now() + QUARANTINE_MS / 2;
+    expect(h.store.dueDeliveries(100)).toEqual([]);
+
+    await h.install();
+    const event = messageReceived();
+    await h.deliver(event);
+    await h.worker.processOnce();
+    expect(h.deliveryOf(event)).toMatchObject({ status: "done" });
+  });
+
+  it("fails an unreadable delivery and carries on with the rest", async () => {
+    const h = await harness();
+    await h.install();
+    const a = messageReceived({ messageId: "pho_msg_a" });
+    const b = messageReceived({ messageId: "pho_msg_b" });
+    await h.deliver(a);
+    await h.deliver(b);
+    // As if DATA_ENCRYPTION_KEY had changed under the queue.
+    await h.workerWith(randomBytes(32)).processOnce();
+    expect(h.deliveryOf(a)).toMatchObject({ status: "failed", last_error: "unreadable payload", payload_sealed: null });
+    expect(h.deliveryOf(b)).toMatchObject({ status: "failed", last_error: "unreadable payload" });
+    expect(h.supermemory.calls).toHaveLength(0);
   });
 
   it("fails a delivery naming another organization than the installation's", async () => {
@@ -240,8 +282,36 @@ describe("App subscription, end to end", () => {
     const event = messageReceived({ messageId: "pho_msg_2" });
     await h.deliver(event);
     await h.worker.processOnce();
+    await Promise.all(h.rechecks);
     expect(h.supermemory.calls).toHaveLength(0);
-    expect(h.deliveryOf(event)).toMatchObject({ status: "skipped", payload_sealed: null });
+    expect(h.deliveryOf(event)).toMatchObject({ status: "held" });
+    // Still inactive a day later: dropped.
+    h.state.clock = Date.now() + QUARANTINE_MS + 1_000;
+    await h.worker.processOnce();
+    expect(h.supermemory.calls).toHaveLength(0);
+    expect(h.deliveryOf(event)).toMatchObject({ status: "skipped", last_error: "installation inactive", payload_sealed: null });
+  });
+
+  it("relays what arrives right after a resume, before the next health check", async () => {
+    const h = await harness();
+    await h.install();
+    h.state.revoked = true;
+    await h.installations.checkAll();
+    expect(h.store.getInstallation(INSTALLATION_ID)).toMatchObject({ status: "inactive" });
+
+    // Resumed in Photon; this service still thinks it's suspended.
+    h.state.revoked = false;
+    const event = messageReceived({ messageId: "pho_msg_3" });
+    await h.deliver(event);
+    await h.worker.processOnce();
+    expect(h.deliveryOf(event)).toMatchObject({ status: "held" });
+
+    // Holding it asked for a check, which finds the App active again and releases it.
+    await Promise.all(h.rechecks);
+    expect(h.store.getInstallation(INSTALLATION_ID)).toMatchObject({ status: "active" });
+    await h.worker.processOnce();
+    expect(h.deliveryOf(event)).toMatchObject({ status: "done" });
+    expect(h.supermemory.calls).toHaveLength(1);
   });
 
   it("retries Supermemory's 5xx later and gives up on a 4xx", async () => {

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { getSignedCookie, setSignedCookie } from "hono/cookie";
 import { randomToken, seal } from "./crypto.ts";
 import type { Store } from "./db.ts";
@@ -9,6 +10,8 @@ import { parseAppEvent, verifyWebhook, type AppDelivery } from "./relay/verify.t
 
 const SESSION_COOKIE = "sm_session";
 const STATE_TTL_MS = 15 * 60_000;
+/** Far above any message event; anything bigger is refused before it's read or verified. */
+export const MAX_WEBHOOK_BYTES = 1024 * 1024;
 
 export interface AppDependencies {
   store: Store;
@@ -106,7 +109,8 @@ export function createApp(deps: AppDependencies) {
   // installation's projects here, signed with the App's one secret; the
   // signed `app_installation_id` says whose they are. Queued once per
   // installation and event (Photon's retries are no-ops), answered right away.
-  app.post("/webhooks/photon", async (c) => {
+  const webhookBodyLimit = bodyLimit({ maxSize: MAX_WEBHOOK_BYTES, onError: (c) => c.body(null, 413) });
+  app.post("/webhooks/photon", webhookBodyLimit, async (c) => {
     const rawBody = await c.req.text();
     const webhookId = c.req.header("webhook-id");
     let event: { type?: unknown };
